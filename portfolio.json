@@ -5,15 +5,15 @@
     "VVSM.DE": { "shares": 2, "avg_price": 52.01 },
     "IS3Q.DE": { "shares": 26, "avg_price": 67.53 },
     "BTC-EUR": { "shares": 0.031285, "avg_price": 88010.99 },
-    "PPFB.SG": { "shares": 4, "avg_price": 69.39 },
+    "PPFB.DE": { "shares": 4, "avg_price": 69.39 },
     "U3O8.DE": { "shares": 13, "avg_price": 26.48 }
-},
+  },
   "monthly_injection": 400,
   "btc_cap": 0.25,
   "max_drawdown": 0.25,
-  "target_goal": 150000
-}
+  "target_goal": 150000,
   "telegram_token": "8256161361:AAFqdfl7uTe02FGf6pCzP5qetDMdK-DUFy0",
-"telegram_chat_id": "8247498069"
+  "telegram_chat_id": "8247498069"
+}
 
-  
+
