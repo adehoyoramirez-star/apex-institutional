@@ -2,117 +2,176 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import json
 import plotly.express as px
-import requests
 from scipy.optimize import minimize
+import requests
 
-st.set_page_config(layout="wide", page_title="APEX Institutional")
+st.set_page_config(layout="wide", page_title="APEX 150K ELITE")
 
 # =========================
-# CONFIG (Respetando tu portfolio.json)
+# CONFIG BASE
 # =========================
-with open("portfolio.json") as f:
-    config = json.load(f)
 
-positions = config["positions"]
-monthly_injection = config["monthly_injection"]
-btc_cap = config["btc_cap"]
-target_goal = config["target_goal"]
-telegram_token = config.get("telegram_token")
-telegram_chat = config.get("telegram_chat_id")
+CONFIG = {
+    "monthly_injection": 400,
+    "cash_reserve": 150,
+    "target_goal": 150000,
+    "structural_reserve_pct": 0.08,
+    "btc_cap": 0.30,
+    "telegram_token": "",
+    "telegram_chat_id": "",
+    "positions": {
+        "BTC-EUR": {"shares": 0.05},
+        "EMXC.DE": {"shares": 5},
+        "IS3Q.DE": {"shares": 3},
+        "PPFB.DE": {"shares": 2},
+        "U3O8.DE": {"shares": 4},
+        "VVSM.DE": {"shares": 1},
+        "ZPRR.DE": {"shares": 2}
+    }
+}
+
+monthly_injection = CONFIG["monthly_injection"]
+cash_reserve = CONFIG["cash_reserve"]
+target_goal = CONFIG["target_goal"]
+reserve_pct = CONFIG["structural_reserve_pct"]
+btc_cap = CONFIG["btc_cap"]
+positions = CONFIG["positions"]
+
 tickers = list(positions.keys())
 
-def send_telegram(msg):
-    if telegram_token and telegram_chat:
-        url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
-        try:
-            requests.post(url, data={"chat_id": telegram_chat, "text": msg, "parse_mode": "Markdown"})
-        except:
-            pass
+# =========================
+# DATA
+# =========================
 
-# =========================
-# DOWNLOAD DATA
-# =========================
 all_tickers = tickers + ["^VIX", "^TNX", "^GSPC"]
-raw_data = yf.download(all_tickers, period="5y", auto_adjust=True)["Close"].ffill()
+raw = yf.download(all_tickers, period="5y", auto_adjust=True)["Close"].ffill()
 
-data = raw_data[tickers].ffill()
+data = raw[tickers]
 returns = data.pct_change().dropna()
 latest_prices = data.iloc[-1]
 
-# =========================
-# INDICADORES (ERP, VIX, RSI)
-# =========================
-bond_10y = raw_data["^TNX"].iloc[-1] / 100
-erp_real = (1 / 24.5) - bond_10y 
+btc_price = latest_prices["BTC-EUR"]
+vix = raw["^VIX"].iloc[-1]
+sp500 = raw["^GSPC"]
 
-vix_now = float(raw_data["^VIX"].iloc[-1])
-vix_p70 = float(raw_data["^VIX"].quantile(0.7))
-vix_p30 = float(raw_data["^VIX"].quantile(0.3))
+# =========================
+# RÉGIMEN + ATAQUE
+# =========================
 
+vix_p80 = raw["^VIX"].quantile(0.8)
+vix_p20 = raw["^VIX"].quantile(0.2)
+
+regime = "NEUTRAL"
+target_vol = 0.16
+attack = False
+
+if vix > vix_p80:
+    regime = "RISK_OFF"
+    target_vol = 0.10
+elif vix < vix_p20:
+    regime = "RISK_ON"
+    target_vol = 0.22
+
+# Ataque extremo BTC (-2σ)
 btc_series = data["BTC-EUR"]
 ma200 = btc_series.rolling(200).mean()
 std200 = btc_series.rolling(200).std()
 btc_z = (btc_series.iloc[-1] - ma200.iloc[-1]) / std200.iloc[-1]
 
-delta = btc_series.diff()
-gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-rs = gain / loss
-btc_rsi = 100 - (100 / (1 + rs.iloc[-1]))
-
-# RÉGIMEN
-regime, target_vol, attack_mode = "NEUTRAL", 0.15, False
-if vix_now > vix_p70: regime, target_vol = "RISK_OFF", 0.10
-elif vix_now < vix_p30: regime, target_vol = "RISK_ON", 0.22
-if btc_z < -2: regime, target_vol, attack_mode = "ATTACK_BTC", 0.25, True
+if btc_z < -2:
+    attack = True
+    regime = "ATTACK_MODE"
 
 # =========================
-# OPTIMIZADOR
+# OPTIMIZACIÓN
 # =========================
-cov = returns.cov() * 252
-mu = returns.mean() * 252
-def port_vol(w): return np.sqrt(w.T @ cov @ w)
-def objective(w): return -(w @ mu)
+
+cov = returns.cov() * 12
+mu = returns.mean() * 12
+
+def port_vol(w):
+    return np.sqrt(w.T @ cov @ w)
+
+def objective(w):
+    return -(w @ mu)
 
 n = len(tickers)
-bounds = [(0.02, 0.45) for _ in tickers]
-idx_btc = tickers.index("BTC-EUR")
-bounds[idx_btc] = (0.02, 0.35 if attack_mode else btc_cap)
+bounds = [(0.02, 0.40) for _ in range(n)]
+btc_idx = tickers.index("BTC-EUR")
+bounds[btc_idx] = (0.02, btc_cap if not attack else 0.40)
 
-res = minimize(objective, np.ones(n)/n, bounds=bounds, 
-               constraints=[{'type':'eq','fun': lambda w: np.sum(w)-1},
-                            {'type':'ineq','fun': lambda w: target_vol - port_vol(w)}])
+res = minimize(
+    objective,
+    np.ones(n)/n,
+    bounds=bounds,
+    constraints=[
+        {'type':'eq','fun': lambda w: np.sum(w)-1},
+        {'type':'ineq','fun': lambda w: target_vol - port_vol(w)}
+    ]
+)
 
-# PESOS ORDENADOS PARA EVITAR CRUCE DE DATOS
-optimal_weights = pd.Series(res.x, index=tickers)
-
-# =========================
-# MONTE CARLO (Probabilidad e Histograma)
-# =========================
-total_value = sum(positions[t]["shares"] * latest_prices[t] for t in tickers)
-mu_p, vol_p = optimal_weights @ mu, port_vol(optimal_weights)
-sims = 10000
-mc = (total_value + (monthly_injection * 120)) * np.exp((mu_p - 0.5 * vol_p**2) + vol_p * np.random.normal(0, 1, sims))
-prob_goal = np.mean(mc >= target_goal)
+weights = pd.Series(res.x, index=tickers)
 
 # =========================
-# RESERVA Y ÓRDENES
+# CARTERA ACTUAL
 # =========================
-reserve_file = "cash_reserve.csv"
-try:
-    current_reserve = float(pd.read_csv(reserve_file)["reserve"].iloc[-1])
-except:
-    current_reserve = 0.0
 
-total_cash = monthly_injection + current_reserve
-orders, spent = {}, 0
+current_values = {
+    t: positions[t]["shares"] * latest_prices[t]
+    for t in tickers
+}
+
+current_total = sum(current_values.values())
+current_weights = pd.Series(current_values) / current_total
+
+# =========================
+# MONTE CARLO MENSUAL REAL
+# =========================
+
+years = 10
+months = years * 12
+sims = 5000
+
+mu_p = weights @ mu
+vol_p = port_vol(weights)
+
+monthly_mu = mu_p / 12
+monthly_vol = vol_p / np.sqrt(12)
+
+mc_results = []
+
+for _ in range(sims):
+    value = current_total
+    for m in range(months):
+        shock = np.random.normal(monthly_mu, monthly_vol)
+        value = value * (1 + shock) + monthly_injection
+    mc_results.append(value)
+
+mc_results = np.array(mc_results)
+prob_goal = np.mean(mc_results >= target_goal)
+
+# =========================
+# RESERVA INTELIGENTE
+# =========================
+
+structural_reserve = reserve_pct * (current_total + monthly_injection)
+usable_cash = max(0, (cash_reserve + monthly_injection) - structural_reserve)
+
+if attack:
+    usable_cash = cash_reserve + monthly_injection
+
+# =========================
+# ÓRDENES
+# =========================
+
+orders = {}
+spent = 0
 
 for t in tickers:
+    alloc = weights[t] * usable_cash
     price = latest_prices[t]
-    if pd.isna(price) or price <= 0: continue
-    alloc = optimal_weights[t] * total_cash
+
     if t == "BTC-EUR":
         units = round(alloc / price, 6)
         orders[t] = units
@@ -123,52 +182,66 @@ for t in tickers:
             orders[t] = units
             spent += units * price
 
-new_reserve = total_cash - spent
-pd.DataFrame({"reserve": [new_reserve]}).to_csv(reserve_file, index=False)
+remaining_reserve = cash_reserve + monthly_injection - spent
 
 # =========================
-# DASHBOARD VISUAL
+# DASHBOARD
 # =========================
-st.title("🦅 APEX INSTITUTIONAL")
 
-# KPIs
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("RÉGIMEN", regime)
-m2.metric("PROB. ÉXITO", f"{prob_goal:.1%}")
-m3.metric("BTC RSI", f"{btc_rsi:.2f}")
-m4.metric("ERP REAL", f"{erp_real:.2%}")
+st.title("🦅 APEX 150K ELITE")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("RÉGIMEN", regime)
+c2.metric("BTC Precio", f"{btc_price:,.0f} €")
+c3.metric("Probabilidad 150K", f"{prob_goal:.1%}")
+c4.metric("Reserva Actual", f"{remaining_reserve:.2f} €")
 
 st.divider()
 
-col_l, col_r = st.columns(2)
-with col_l:
-    st.subheader("🎯 Pesos Objetivo")
-    # FIX: Se asocian nombres y valores explícitamente para evitar cruce
-    fig_donut = px.pie(
-        names=optimal_weights.index, 
-        values=optimal_weights.values, 
-        hole=0.6,
-        color_discrete_sequence=px.colors.qualitative.Bold
-    )
-    fig_donut.update_traces(textinfo='percent+label')
-    st.plotly_chart(fig_donut, use_container_width=True)
+# Donut Objetivo
+st.subheader("🎯 Objetivo vs Actual")
 
-with col_r:
-    st.subheader("🛒 Órdenes")
-    st.json(orders)
-    st.write(f"**Pólvora sobrante:** {new_reserve:.2f}€")
+df_compare = pd.DataFrame({
+    "Objetivo": weights,
+    "Actual": current_weights
+}).fillna(0)
 
-# HISTOGRAMA MONTE CARLO (Línea 174 corregida)
-st.subheader("📈 Distribución de Valor Final (10 Años)")
-fig_mc = px.histogram(
-    mc, 
-    nbins=50, 
-    title="Simulación de Capital Final",
-    labels={'value': 'Capital en €', 'count': 'Frecuencia'}
+fig = px.pie(
+    names=df_compare.index,
+    values=df_compare["Objetivo"],
+    hole=0.6,
+    title="Asignación Objetivo"
 )
+st.plotly_chart(fig, use_container_width=True)
+
+st.write("Desviación actual:")
+st.dataframe((df_compare["Actual"] - df_compare["Objetivo"]).sort_values())
+
+# Monte Carlo
+st.subheader("📈 Monte Carlo 10 años")
+fig_mc = px.histogram(mc_results, nbins=50)
 st.plotly_chart(fig_mc, use_container_width=True)
 
-if st.button("🚀 Enviar Informe"):
-    msg = f"🦅 *APEX:* {regime}\n*Prob:* {prob_goal:.1%}\n*ERP:* {erp_real:.2%}\n\n*Compras:* `{orders}`"
-    send_telegram(msg)
-    st.toast("Informe enviado")
+# Diagnóstico
+st.subheader("🧠 Diagnóstico Mercado")
+
+if regime == "RISK_ON":
+    st.success("Volatilidad baja. Momentum favorable. Entorno constructivo.")
+elif regime == "RISK_OFF":
+    st.warning("Alta volatilidad. Riesgo elevado. Priorizando defensa.")
+elif regime == "ATTACK_MODE":
+    st.error("Capitulación extrema detectada. Activando modo ataque.")
+else:
+    st.info("Mercado neutral. Posicionamiento equilibrado.")
+
+# Compras
+st.subheader("🛒 Qué Comprar y Por Qué")
+
+for t in orders:
+    reason = "Alineación a peso óptimo."
+    if attack and t == "BTC-EUR":
+        reason = "Evento extremo BTC detectado. Ataque activado."
+    st.write(f"• **{t}** → {orders[t]} unidades | {reason}")
+
+st.write(f"Reserva estructural protegida: {structural_reserve:.2f} €")
+st.write(f"Reserva restante tras compras: {remaining_reserve:.2f} €")
