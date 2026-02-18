@@ -18,7 +18,7 @@ STRUCTURAL_RESERVE_PCT = 0.08
 DEFAULT_MONTHLY = 400
 
 # Lista de tickers actualizada
-TICKERS = ["BTC-EUR", "EMXC.DE", "IS3Q.DE", "PPFB.DE", "U3O8.DE", "VVSM.DE", "ZPRR.DE"]
+TICKERS = ["BTC-EUR", "EMXC.DE", "IS3Q.DE", "PPFB.DE", "URNU.DE", "VVSM.DE", "ZPRR.DE"]
 
 # Nuevo mapeo sectorial (ajústalo según tu criterio)
 SECTOR_MAP = {
@@ -26,7 +26,7 @@ SECTOR_MAP = {
     "EMXC.DE": "emerging",
     "IS3Q.DE": "global_quality",
     "PPFB.DE": "gold",
-    "U3O8.DE": "uranium",
+    "URNU.DE": "uranium",
     "VVSM.DE": "semis",
     "ZPRR.DE": "smallcap_usa"
 }
@@ -326,3 +326,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
