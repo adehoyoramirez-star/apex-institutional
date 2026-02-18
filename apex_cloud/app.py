@@ -29,38 +29,40 @@ def send_telegram(msg):
         requests.post(url, data={"chat_id": telegram_chat, "text": msg, "parse_mode": "Markdown"})
 
 # =========================
-# DOWNLOAD DATA
+# DOWNLOAD DATA (Seguro)
 # =========================
 all_tickers = tickers + ["^VIX", "^TNX", "^GSPC"]
 raw_data = yf.download(all_tickers, period="5y", auto_adjust=True)["Close"].ffill()
 
-data = raw_data[tickers]
+data = raw_data[tickers].ffill()
 returns = data.pct_change().dropna()
 latest_prices = data.iloc[-1]
 
 # =========================
-# VALOR REAL Y ESTADO ACTUAL
+# CÁLCULO INDICADORES (VIX, ERP, BTC + RSI)
 # =========================
-values = {t: positions[t]["shares"] * latest_prices[t] for t in tickers}
-total_value = sum(values.values())
+# 1. ERP REAL
+bond_10y = raw_data["^TNX"].iloc[-1] / 100
+erp_real = (1 / 24.5) - bond_10y 
 
-# =========================
-# INDICADORES MACRO (GRANDES)
-# =========================
+# 2. VIX
 vix_series = raw_data["^VIX"]
 vix_now = float(vix_series.iloc[-1])
 vix_p70 = float(vix_series.quantile(0.7))
 vix_p30 = float(vix_series.quantile(0.3))
 
-bond_10y = raw_data["^TNX"].iloc[-1] / 100
-erp_real = (1 / 24.5) - bond_10y 
-
+# 3. BTC: Z-Score y RSI
 btc_series = data["BTC-EUR"]
-btc_price = btc_series.iloc[-1]
+# Z-Score
 ma200 = btc_series.rolling(200).mean()
 std200 = btc_series.rolling(200).std()
-btc_z = (btc_price - ma200.iloc[-1]) / std200.iloc[-1]
-btc_dd = (btc_price / btc_series.cummax().iloc[-1]) - 1
+btc_z = (btc_series.iloc[-1] - ma200.iloc[-1]) / std200.iloc[-1]
+# RSI (14 períodos)
+delta = btc_series.diff()
+gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+rs = gain / loss
+btc_rsi = 100 - (100 / (1 + rs.iloc[-1]))
 
 # DETERMINACIÓN DE RÉGIMEN
 regime, target_vol, attack_mode = "NEUTRAL", 0.15, False
@@ -69,11 +71,11 @@ if vix_now > vix_p70:
 elif vix_now < vix_p30:
     regime, target_vol = "RISK_ON", 0.22
 
-if btc_z < -2 and btc_dd < -0.35:
+if btc_z < -2:
     regime, target_vol, attack_mode = "ATTACK_BTC", 0.25, True
 
 # =========================
-# OPTIMIZADOR (Lógica Original)
+# OPTIMIZADOR
 # =========================
 cov = returns.cov() * 252
 mu = returns.mean() * 252
@@ -91,11 +93,13 @@ res = minimize(objective, np.ones(n)/n, bounds=bounds,
 optimal_weights = pd.Series(res.x, index=tickers)
 
 # =========================
-# MONTE CARLO
+# MONTE CARLO (Corregido para no dar 0)
 # =========================
+total_value = sum(positions[t]["shares"] * latest_prices[t] for t in tickers)
 mu_p, vol_p = optimal_weights @ mu, port_vol(optimal_weights)
-mc_results = np.array([ (total_value + monthly_injection*120) * (1 + np.random.normal(mu_p, vol_p)) for _ in range(10000)])
-prob_goal = np.mean(mc_results >= target_goal)
+# Simulación simplificada pero efectiva
+mc_final = (total_value + monthly_injection*120) * np.exp((mu_p - 0.5 * vol_p**2) + vol_p * np.random.normal(0, 1, 10000))
+prob_goal = np.mean(mc_final >= target_goal)
 
 # =========================
 # GESTIÓN DE RESERVA Y ÓRDENES
@@ -109,16 +113,17 @@ except:
 total_cash = monthly_injection + current_reserve
 orders, spent = {}, 0
 
-# Corregimos asignación: Aseguramos que se use el peso óptimo sobre el total_cash
 for t in tickers:
     price = latest_prices[t]
-    allocation = optimal_weights[t] * total_cash
+    if pd.isna(price) or price <= 0: continue
+    
+    alloc = optimal_weights[t] * total_cash
     if t == "BTC-EUR":
-        units = round(allocation / price, 6)
+        units = round(alloc / price, 6)
         orders[t] = units
         spent += units * price
     else:
-        units = int(allocation // price)
+        units = int(alloc // price)
         if units > 0:
             orders[t] = units
             spent += units * price
@@ -127,66 +132,43 @@ new_reserve = total_cash - spent
 pd.DataFrame({"reserve": [new_reserve]}).to_csv(reserve_file, index=False)
 
 # =========================
-# DASHBOARD VISUAL
+# DASHBOARD VISUAL (MÓVIL FRIENDLY)
 # =========================
-st.title("🦅 APEX INSTITUTIONAL DEFINITIVE")
+st.title("🦅 APEX INSTITUTIONAL")
 
-# FILA 1: KPIs GRANDES
+# MÉTRICAS PRINCIPALES
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("RÉGIMEN", regime)
-c2.metric("PROBABILIDAD ÉXITO", f"{prob_goal:.1%}")
-c3.metric("ERP REAL", f"{erp_real:.2%}")
-c4.metric("VIX", f"{vix_now:.2f}")
+c2.metric("PROBABILIDAD", f"{prob_goal:.1%}")
+c3.metric("BTC RSI", f"{btc_rsi:.2f}", "Sobreventa < 30" if btc_rsi < 30 else "")
+c4.metric("ERP REAL", f"{erp_real:.2%}")
 
-# EXPLICACIÓN DEL MERCADO
 st.divider()
-st.subheader("📝 Análisis de Situación")
-col_exp1, col_exp2 = st.columns(2)
 
-with col_exp1:
-    if attack_mode:
-        st.error(f"**ESTADO DE ALERTA:** Bitcoin está en zona de capitulación ({btc_z:.2f} Z). El sistema fuerza compra máxima.")
-    elif regime == "RISK_OFF":
-        st.warning("**ESTADO DEFENSIVO:** El pánico (VIX) supera el percentil 70. Protegemos capital.")
-    else:
-        st.success("**ESTADO EXPANSIVO:** Volatilidad controlada. Maximizando retornos.")
+# EXPLICACIÓN
+st.subheader("📝 Análisis de Mercado")
+col_a, col_b = st.columns(2)
+with col_a:
+    st.write(f"**VIX Actual:** {vix_now:.2f} (Umbral Miedo: {vix_p70:.2f})")
+    st.write(f"**BTC Z-Score:** {btc_z:.2f} (Capitulación < -2)")
+with col_b:
+    txt = "MERCADO ATRACTIVO" if erp_real > 0.02 else "MERCADO CARO"
+    st.write(f"**Lectura ERP:** {txt}")
+    st.write(f"**Reserva para hoy:** {total_cash:.2f}€")
 
-with col_exp2:
-    st.info(f"**Qué significa esto:** Con un ERP de {erp_real:.2%}, la bolsa {'es' if erp_real > 0.02 else 'no es'} atractiva frente al bono. El sistema invertirá **{total_cash:.2f}€** este mes.")
-
-# FILA 2: GRÁFICOS
-col_l, col_r = st.columns([1, 1])
-
+# GRÁFICOS
+col_l, col_r = st.columns(2)
 with col_l:
-    st.subheader("🎯 Pesos Óptimos Calculados")
-    # CORRECCIÓN DONUT: Aseguramos que lea los pesos del optimizador
-    fig_donut = px.pie(
-        names=optimal_weights.index, 
-        values=optimal_weights.values, 
-        hole=0.5,
-        color_discrete_sequence=px.colors.qualitative.Prism
-    )
-    fig_donut.update_traces(textinfo='percent+label')
-    st.plotly_chart(fig_donut, use_container_width=True)
+    st.subheader("🎯 Pesos Objetivo")
+    fig = px.pie(names=optimal_weights.index, values=optimal_weights.values, hole=0.6)
+    st.plotly_chart(fig, use_container_width=True)
 
 with col_r:
-    st.subheader("🛒 Órdenes y Ejecución")
-    st.write("Copia estas órdenes en tu broker:")
+    st.subheader("🛒 Compras")
     st.json(orders)
-    st.write(f"**Pólvora sobrante (reserva):** {new_reserve:.2f}€")
+    st.write(f"Sobrante: {new_reserve:.2f}€")
 
-# TELEGRAM CON FORMATO PROFESIONAL
-if st.button("🚀 Enviar Informe a Telegram"):
-    msg = f"""🦅 *INFORME APEX INSTITUTIONAL*
-
-*Régimen:* `{regime}`
-*Prob. Objetivo:* `{prob_goal:.1%}`
-*ERP Real:* `{erp_real:.2%}`
-*VIX:* `{vix_now:.2f}`
-
-🛒 *ÓRDENES:*
-`{json.dumps(orders, indent=2)}`
-
-💰 *RESERVA ACUMULADA:* `{new_reserve:.2f}€`"""
-    send_telegram(msg)
-    st.toast("Informe enviado!")
+# TELEGRAM
+if st.button("🚀 Enviar Informe"):
+    msg = f"🦅 *APEX:* {regime}\n*Prob:* {prob_goal:.1%}\n*BTC RSI:* {btc_rsi:.2f}\n*VIX:* {vix_now:.2f}\n\n*Compras:* `{orders}`"
+    send_telegram(
