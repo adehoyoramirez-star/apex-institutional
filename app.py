@@ -8,22 +8,23 @@ from scipy.optimize import minimize
 import json
 import os
 from datetime import datetime
-import requests
 
-# ================== CONFIGURACIÓN INICIAL ==================
+# ================== CONFIGURACIÓN ==================
 st.set_page_config(layout="wide", page_title="APEX 150K ELITE")
 
-# Archivo de persistencia
+# Archivos
 PORTFOLIO_FILE = "portfolio.json"
 
 # Parámetros fijos
 TARGET_GOAL = 150000
 STRUCTURAL_RESERVE_PCT = 0.08
-BTC_CAP = 0.25
-SECTOR_CAP = 0.35  # Límite por temática (ej. semis + uranio juntos no más de 35%)
+SECTOR_CAP = 0.35          # Límite por sector (ej. semis + uranio juntos)
+DEFAULT_MONTHLY = 400       # Aporte mensual por defecto
+
+# Lista de tickers (orden fijo)
 TICKERS = ["BTC-EUR", "EMXC.DE", "IS3Q.DE", "PPFB.DE", "U3O8.DE", "VVSM.DE", "ZPRR.DE"]
 
-# Mapeo sectorial para control de concentración
+# Mapeo sectorial
 SECTOR_MAP = {
     "BTC-EUR": "crypto",
     "EMXC.DE": "equity_em",
@@ -36,12 +37,21 @@ SECTOR_MAP = {
 
 # ================== FUNCIONES DE PERSISTENCIA ==================
 def load_portfolio():
-    """Carga la cartera desde JSON. Si no existe, crea una por defecto."""
+    """Carga cartera desde JSON. Si no existe, crea una por defecto."""
     if os.path.exists(PORTFOLIO_FILE):
         with open(PORTFOLIO_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Asegurar que todas las claves existen
+        if "positions" not in data:
+            data["positions"] = {}
+        for t in TICKERS:
+            if t not in data["positions"]:
+                data["positions"][t] = {"shares": 0, "avg_price": 0}
+        if "cash_reserve" not in data:
+            data["cash_reserve"] = 0
+        return data
     else:
-        # Estructura por defecto (vacía)
+        # Estructura por defecto
         default = {
             "positions": {t: {"shares": 0, "avg_price": 0} for t in TICKERS},
             "cash_reserve": 0,
@@ -51,41 +61,28 @@ def load_portfolio():
         return default
 
 def save_portfolio(portfolio):
-    """Guarda la cartera en JSON."""
+    """Guarda cartera en JSON."""
     with open(PORTFOLIO_FILE, "w") as f:
         json.dump(portfolio, f, indent=2)
 
-# ================== DESCARGA DE DATOS ==================
-@st.cache_data(ttl=300)  # Cache 5 minutos
+# ================== DATOS DE MERCADO ==================
+@st.cache_data(ttl=300)
 def get_market_data():
-    """Descarga precios y datos macro."""
-    all_tickers = TICKERS + ["^VIX", "^TNX", "^GSPC", "M2SL"]  # M2SL necesita FRED
+    """Descarga precios y datos macro (5 años)."""
+    all_tickers = TICKERS + ["^VIX", "^TNX", "^GSPC"]
     try:
         raw = yf.download(all_tickers, period="5y", auto_adjust=True, progress=False)["Close"]
     except:
-        # Fallback a datos más básicos
-        raw = yf.download(TICKERS + ["^VIX", "^TNX", "^GSPC"], period="5y", auto_adjust=True, progress=False)["Close"]
-        # M2SL lo obtenemos aparte si es necesario (simulamos)
-        # En un caso real usarías FRED API, pero para simplificar lo omitimos o usamos un valor fijo
-    
+        raw = yf.download(all_tickers, period="5y", auto_adjust=True, progress=False)["Close"]
     raw = raw.ffill()
     prices = raw[TICKERS]
     macro = raw[["^VIX", "^TNX", "^GSPC"]]
-    
-    # Calcular ERP aproximado (S&P 500 earnings yield - 10y Treasury)
-    # Usamos datos estáticos si no tenemos M2SL (en producción usarías FRED)
-    # Simulamos earnings yield ~ 1/PE del S&P 500 (aprox 4.5% ahora)
-    earnings_yield = 0.045  # Placeholder
-    risk_free = macro["^TNX"].iloc[-1] / 100 if not macro["^TNX"].isna().all() else 0.04
-    erp = earnings_yield - risk_free
-    
-    return prices, macro, erp
+    return prices, macro
 
-# ================== CÁLCULO DE RÉGIMEN ==================
+# ================== RÉGIMEN DE MERCADO ==================
 def get_regime(vix, vix_series):
     vix_p80 = vix_series.quantile(0.8)
     vix_p20 = vix_series.quantile(0.2)
-    
     if vix > vix_p80:
         return "RISK_OFF", 0.10
     elif vix < vix_p20:
@@ -99,77 +96,62 @@ def check_btc_attack(btc_series):
     btc_z = (btc_series.iloc[-1] - ma200.iloc[-1]) / std200.iloc[-1]
     return btc_z < -2, btc_z
 
-# ================== OPTIMIZACIÓN ROBUSTA ==================
-def optimize_portfolio(returns, target_vol, btc_cap, sector_map, sector_cap, attack_mode=False):
+# ================== OPTIMIZACIÓN CON LÍMITES EN BTC ==================
+def optimize_portfolio(returns, target_vol, btc_min, btc_max, sector_map, sector_cap):
     """
-    Optimización con penalización de concentración sectorial.
-    Maximiza Sharpe sujeto a: 
-      - Volatilidad <= target_vol
-      - Límite individual (ya definido en bounds)
-      - Límite por sector (sector_cap)
+    Maximiza Sharpe con restricciones:
+      - volatilidad <= target_vol
+      - límites individuales (btc entre btc_min y btc_max, otros entre 2% y 40%)
+      - límite por sector (sector_cap)
     """
     mu = returns.mean() * 252
     cov = returns.cov() * 252
     n = len(returns.columns)
     
-    # Función objetivo: negativo Sharpe (maximizar Sharpe)
     def neg_sharpe(w):
         port_return = w @ mu
         port_vol = np.sqrt(w @ cov @ w)
         return -port_return / port_vol
     
-    # Restricciones: suma = 1
+    # Restricciones
     constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
-    
-    # Restricción de volatilidad
     constraints.append({'type': 'ineq', 'fun': lambda w: target_vol - np.sqrt(w @ cov @ w)})
     
-    # Restricciones sectoriales (límite superior por sector)
-    sectors = list(set(sector_map.values()))
-    for sector in sectors:
+    # Límites sectoriales
+    for sector in set(sector_map.values()):
         indices = [i for i, t in enumerate(returns.columns) if sector_map[t] == sector]
         if indices:
-            constraints.append({
-                'type': 'ineq',
-                'fun': lambda w, idx=indices: sector_cap - np.sum(w[idx])
-            })
+            constraints.append({'type': 'ineq', 'fun': lambda w, idx=indices: sector_cap - np.sum(w[idx])})
     
     # Límites individuales
     bounds = [(0.02, 0.40) for _ in range(n)]
     btc_idx = returns.columns.get_loc("BTC-EUR")
-    # En ataque, permitimos más BTC
-    bounds[btc_idx] = (0.02, btc_cap if not attack_mode else 0.40)
+    bounds[btc_idx] = (btc_min, btc_max)   # Forzamos el rango de BTC
     
-    # Punto de partida: pesos iguales
+    # Punto inicial
     w0 = np.ones(n) / n
-    
-    # Optimización
-    result = minimize(neg_sharpe, w0, bounds=bounds, constraints=constraints, 
+    result = minimize(neg_sharpe, w0, bounds=bounds, constraints=constraints,
                       method='SLSQP', options={'ftol': 1e-6})
     
     if not result.success:
-        # Fallback a mínima varianza
-        def port_vol(w):
-            return np.sqrt(w @ cov @ w)
-        result = minimize(port_vol, w0, bounds=bounds, constraints=constraints, 
-                          method='SLSQP', options={'ftol': 1e-6})
+        # Fallback: mínima varianza
+        def port_vol(w): return np.sqrt(w @ cov @ w)
+        result = minimize(port_vol, w0, bounds=bounds, constraints=constraints, method='SLSQP')
     
     return pd.Series(result.x, index=returns.columns)
 
 # ================== CONTRIBUCIÓN AL RIESGO ==================
 def risk_contribution(weights, cov):
-    """Calcula la contribución porcentual al riesgo total."""
     port_var = weights @ cov @ weights
     marginal_contrib = cov @ weights
     risk_contrib = weights * marginal_contrib / np.sqrt(port_var)
-    return risk_contrib / risk_contrib.sum()  # normalizado
+    return risk_contrib / risk_contrib.sum()
 
-# ================== MONTE CARLO POR ESCENARIOS ==================
+# ================== MONTE CARLO ==================
 def run_monte_carlo(current_value, monthly_injection, years, mu, vol, n_sims=5000):
     months = years * 12
     monthly_mu = mu / 12
     monthly_vol = vol / np.sqrt(12)
-    
     results = []
     for _ in range(n_sims):
         value = current_value
@@ -181,12 +163,8 @@ def run_monte_carlo(current_value, monthly_injection, years, mu, vol, n_sims=500
 
 # ================== GENERAR ÓRDENES ==================
 def generate_orders(current_weights, target_weights, current_values, cash_available, prices):
-    """
-    Calcula órdenes para acercarse a los pesos objetivo, respetando liquidez.
-    """
     total_value = sum(current_values.values())
     target_values = {t: target_weights[t] * (total_value + cash_available) for t in target_weights.index}
-    
     orders = {}
     spent = 0
     for t in target_weights.index:
@@ -205,27 +183,16 @@ def generate_orders(current_weights, target_weights, current_values, cash_availa
                 if units > 0 and units * price <= cash_available - spent:
                     orders[t] = units
                     spent += units * price
-    
     return orders, spent
 
-# ================== ACTUALIZAR PORTAFOLIO TRAS COMPRAS ==================
 def execute_orders(portfolio, orders, prices):
-    """
-    Actualiza shares y precio medio, y resta la reserva.
-    """
-    cash_spent = 0
     for t, units in orders.items():
         price = prices[t]
-        old = portfolio["positions"].get(t, {"shares": 0, "avg_price": 0})
+        old = portfolio["positions"][t]
         new_shares = old["shares"] + units
-        if new_shares > 0:
-            new_avg = (old["avg_price"] * old["shares"] + units * price) / new_shares
-        else:
-            new_avg = 0
+        new_avg = (old["avg_price"] * old["shares"] + units * price) / new_shares if new_shares > 0 else 0
         portfolio["positions"][t] = {"shares": new_shares, "avg_price": new_avg}
-        cash_spent += units * price
-    
-    portfolio["cash_reserve"] -= cash_spent
+        portfolio["cash_reserve"] -= units * price
     portfolio["last_updated"] = datetime.now().isoformat()
     save_portfolio(portfolio)
     return portfolio
@@ -234,13 +201,15 @@ def execute_orders(portfolio, orders, prices):
 def main():
     st.title("🦅 **APEX 150K ELITE** — HEDGE FUND EDITION")
     
-    # Cargar cartera actual
+    # Cargar cartera
     portfolio = load_portfolio()
     
-    # Sidebar para acciones y entradas
+    # Sidebar
     with st.sidebar:
         st.header("⚙️ Controles")
-        monthly_injection = st.number_input("Aporte mensual (€)", min_value=0, value=400, step=50)
+        monthly_injection = st.number_input("Aporte mensual (€)", min_value=0, value=DEFAULT_MONTHLY, step=50)
+        btc_min = st.slider("Peso mínimo BTC", min_value=0.0, max_value=0.25, value=0.20, step=0.01, format="%.2f")
+        btc_max = st.slider("Peso máximo BTC", min_value=btc_min, max_value=0.40, value=0.25, step=0.01, format="%.2f")
         
         st.markdown("---")
         st.subheader("💾 Estado cartera")
@@ -248,20 +217,18 @@ def main():
             "Reserva actual": f"{portfolio['cash_reserve']:.2f} €",
             "Última actualización": portfolio.get("last_updated", "N/A")
         })
-        
-        if st.button("⟳ Recargar datos de mercado"):
+        if st.button("⟳ Recargar datos"):
             st.cache_data.clear()
             st.rerun()
     
     # Obtener datos de mercado
-    prices_df, macro_df, erp = get_market_data()
+    prices_df, macro_df = get_market_data()
     latest_prices = prices_df.iloc[-1]
     
-    # Calcular valores actuales
+    # Calcular valor actual
     current_values = {}
     for t in TICKERS:
-        pos = portfolio["positions"].get(t, {"shares": 0})
-        shares = pos["shares"]
+        shares = portfolio["positions"].get(t, {}).get("shares", 0)
         current_values[t] = shares * latest_prices[t]
     current_total = sum(current_values.values())
     current_weights = pd.Series({t: current_values[t]/current_total for t in TICKERS})
@@ -276,177 +243,120 @@ def main():
     attack_mode, btc_z = check_btc_attack(btc_series)
     if attack_mode:
         regime = "ATTACK_MODE"
-        target_vol = 0.22  # Permitir más riesgo
+        target_vol = 0.22  # Más riesgo en ataque
     
-    # Optimizar pesos objetivo
+    # Optimizar pesos objetivo con los límites elegidos
     returns = prices_df.pct_change().dropna()
-    target_weights = optimize_portfolio(returns, target_vol, BTC_CAP, SECTOR_MAP, SECTOR_CAP, attack_mode)
+    target_weights = optimize_portfolio(returns, target_vol, btc_min, btc_max, SECTOR_MAP, SECTOR_CAP)
     
-    # Calcular contribución al riesgo actual
+    # Contribución al riesgo actual
     cov = returns.cov() * 252
     risk_contrib = risk_contribution(current_weights.values, cov)
     
-    # Disponible para invertir (reserva actual + aporte mensual)
+    # Disponible para invertir
     total_cash = portfolio["cash_reserve"] + monthly_injection
-    structural_reserve = STRUCTURAL_RESERVE_PCT * (current_total + monthly_injection)  # reserva objetivo
+    structural_reserve = STRUCTURAL_RESERVE_PCT * (current_total + monthly_injection)
     usable_cash = max(0, total_cash - structural_reserve)
-    
-    # En ataque, podemos usar toda la reserva si queremos (pero dejamos la estructural como objetivo)
     if attack_mode:
-        usable_cash = total_cash  # Opcional, pero podemos ser más agresivos
+        usable_cash = total_cash  # En ataque podemos usar todo (opcional)
     
     # Generar órdenes
     orders, spent = generate_orders(current_weights, target_weights, current_values, usable_cash, latest_prices)
     remaining_cash = total_cash - spent
     
-    # ================== DASHBOARD PRINCIPAL ==================
+    # ================== DASHBOARD ==================
     col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("RÉGIMEN", regime, delta=f"VIX {vix:.1f}")
-    with col2:
-        st.metric("BTC Precio", f"{latest_prices['BTC-EUR']:,.0f} €", delta=f"Z-score {btc_z:.2f}")
-    with col3:
-        # Mostrar probabilidad (simulada con escenario base)
-        # Usamos retorno esperado del portafolio objetivo
-        expected_return = target_weights @ (returns.mean() * 252)
-        mc_results_base = run_monte_carlo(current_total, monthly_injection, 10, expected_return, target_vol)
-        prob_base = np.mean(mc_results_base >= TARGET_GOAL)
-        st.metric("Probabilidad 150K", f"{prob_base:.1%}")
-    with col4:
-        st.metric("Reserva actual", f"{portfolio['cash_reserve']:.2f} €", delta=f"Disponible: {usable_cash:.2f}")
+    col1.metric("RÉGIMEN", regime, delta=f"VIX {vix:.1f}")
+    col2.metric("BTC Precio", f"{latest_prices['BTC-EUR']:,.0f} €", delta=f"Z-score {btc_z:.2f}")
+    
+    # Probabilidad (escenario base)
+    expected_return = target_weights @ (returns.mean() * 252)
+    mc_base = run_monte_carlo(current_total, monthly_injection, 10, expected_return, target_vol)
+    prob_base = np.mean(mc_base >= TARGET_GOAL)
+    col3.metric("Probabilidad 150K", f"{prob_base:.1%}")
+    col4.metric("Reserva actual", f"{portfolio['cash_reserve']:.2f} €", delta=f"Disponible: {usable_cash:.2f}")
     
     st.divider()
     
-    # ================== GAUGES MACRO (GRANDES) ==================
+    # ================== GAUGES MACRO ==================
     st.subheader("📊 Panorama Macro")
     col_g1, col_g2, col_g3, col_g4 = st.columns(4)
     
-    with col_g1:
-        # Gauge VIX
-        fig_vix = go.Figure(go.Indicator(
-            mode = "gauge+number",
-            value = vix,
-            title = {'text': "VIX"},
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            gauge = {
-                'axis': {'range': [None, 40]},
-                'bar': {'color': "darkblue"},
-                'steps': [
-                    {'range': [0, 20], 'color': "lightgreen"},
-                    {'range': [20, 30], 'color': "yellow"},
-                    {'range': [30, 40], 'color': "red"}],
-                'threshold': {
-                    'line': {'color': "black", 'width': 4},
-                    'thickness': 0.75,
-                    'value': vix_p80 if 'vix_p80' in locals() else 25}}))
-        fig_vix.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig_vix, use_container_width=True)
+    # Gauge VIX
+    vix_p80 = vix_series.quantile(0.8)
+    fig_vix = go.Figure(go.Indicator(
+        mode="gauge+number", value=vix, title="VIX",
+        gauge={'axis': {'range': [0, 40]},
+               'bar': {'color': 'darkblue'},
+               'steps': [{'range': [0, 20], 'color': 'lightgreen'},
+                         {'range': [20, 30], 'color': 'yellow'},
+                         {'range': [30, 40], 'color': 'red'}],
+               'threshold': {'line': {'color': 'black', 'width': 4}, 'thickness': 0.75, 'value': vix_p80}}))
+    fig_vix.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
+    col_g1.plotly_chart(fig_vix, use_container_width=True)
     
-    with col_g2:
-        # ERP aproximado (usamos un valor fijo por simplicidad, pero podrías calcularlo con datos reales)
-        # En un hedge fund real usarías FRED para earnings yield
-        earnings_yield = 0.045  # Placeholder
-        risk_free = macro_df["^TNX"].iloc[-1] / 100 if not pd.isna(macro_df["^TNX"].iloc[-1]) else 0.04
-        erp_value = earnings_yield - risk_free
-        fig_erp = go.Figure(go.Indicator(
-            mode = "gauge+number",
-            value = erp_value * 100,  # en %
-            title = {'text': "ERP (earnings yield - 10y)"},
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            gauge = {
-                'axis': {'range': [-2, 6]},
-                'bar': {'color': "darkgreen"},
-                'steps': [
-                    {'range': [-2, 1], 'color': "red"},
-                    {'range': [1, 3], 'color': "yellow"},
-                    {'range': [3, 6], 'color': "lightgreen"}],
-                'threshold': {
-                    'line': {'color': "black", 'width': 4},
-                    'thickness': 0.75,
-                    'value': 2.5}}))
-        fig_erp.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig_erp, use_container_width=True)
+    # Gauge ERP (aproximado)
+    risk_free = macro_df["^TNX"].iloc[-1] / 100 if not pd.isna(macro_df["^TNX"].iloc[-1]) else 0.04
+    earnings_yield = 0.045  # Placeholder (mejorable con datos reales)
+    erp = earnings_yield - risk_free
+    fig_erp = go.Figure(go.Indicator(
+        mode="gauge+number", value=erp*100, title="ERP (earning yield - 10y)",
+        number={'suffix': '%'},
+        gauge={'axis': {'range': [-2, 6]},
+               'bar': {'color': 'darkgreen'},
+               'steps': [{'range': [-2, 1], 'color': 'red'},
+                         {'range': [1, 3], 'color': 'yellow'},
+                         {'range': [3, 6], 'color': 'lightgreen'}],
+               'threshold': {'line': {'color': 'black', 'width': 4}, 'thickness': 0.75, 'value': 2.5}}))
+    fig_erp.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
+    col_g2.plotly_chart(fig_erp, use_container_width=True)
     
-    with col_g3:
-        # Drawdown S&P 500
-        sp500 = macro_df["^GSPC"]
-        rolling_max = sp500.expanding().max()
-        drawdown = (sp500 - rolling_max) / rolling_max * 100
-        current_dd = drawdown.iloc[-1]
-        fig_dd = go.Figure(go.Indicator(
-            mode = "gauge+number",
-            value = current_dd,
-            title = {'text': "S&P 500 Drawdown %"},
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            number = {'suffix': "%"},
-            gauge = {
-                'axis': {'range': [-50, 0]},
-                'bar': {'color': "darkred"},
-                'steps': [
-                    {'range': [-10, 0], 'color': "lightgreen"},
-                    {'range': [-20, -10], 'color': "yellow"},
-                    {'range': [-50, -20], 'color': "red"}],
-                'threshold': {
-                    'line': {'color': "black", 'width': 4},
-                    'thickness': 0.75,
-                    'value': -15}}))
-        fig_dd.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig_dd, use_container_width=True)
+    # Gauge Drawdown S&P
+    sp500 = macro_df["^GSPC"]
+    rolling_max = sp500.expanding().max()
+    drawdown = (sp500 - rolling_max) / rolling_max * 100
+    current_dd = drawdown.iloc[-1]
+    fig_dd = go.Figure(go.Indicator(
+        mode="gauge+number", value=current_dd, title="S&P 500 Drawdown %",
+        number={'suffix': '%'},
+        gauge={'axis': {'range': [-50, 0]},
+               'bar': {'color': 'darkred'},
+               'steps': [{'range': [-10, 0], 'color': 'lightgreen'},
+                         {'range': [-20, -10], 'color': 'yellow'},
+                         {'range': [-50, -20], 'color': 'red'}],
+               'threshold': {'line': {'color': 'black', 'width': 4}, 'thickness': 0.75, 'value': -15}}))
+    fig_dd.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
+    col_g3.plotly_chart(fig_dd, use_container_width=True)
     
-    with col_g4:
-        # Z-score BTC
-        fig_z = go.Figure(go.Indicator(
-            mode = "gauge+number",
-            value = btc_z,
-            title = {'text': "BTC Z-score (200d)"},
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            gauge = {
-                'axis': {'range': [-3, 3]},
-                'bar': {'color': "orange"},
-                'steps': [
-                    {'range': [-1, 1], 'color': "lightgreen"},
-                    {'range': [1, 2], 'color': "yellow"},
-                    {'range': [2, 3], 'color': "red"},
-                    {'range': [-2, -1], 'color': "yellow"},
-                    {'range': [-3, -2], 'color': "red"}],
-                'threshold': {
-                    'line': {'color': "black", 'width': 4},
-                    'thickness': 0.75,
-                    'value': -2}}))
-        fig_z.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig_z, use_container_width=True)
+    # Gauge Z-score BTC
+    fig_z = go.Figure(go.Indicator(
+        mode="gauge+number", value=btc_z, title="BTC Z-score (200d)",
+        gauge={'axis': {'range': [-3, 3]},
+               'bar': {'color': 'orange'},
+               'steps': [{'range': [-1, 1], 'color': 'lightgreen'},
+                         {'range': [1, 2], 'color': 'yellow'},
+                         {'range': [2, 3], 'color': 'red'},
+                         {'range': [-2, -1], 'color': 'yellow'},
+                         {'range': [-3, -2], 'color': 'red'}],
+               'threshold': {'line': {'color': 'black', 'width': 4}, 'thickness': 0.75, 'value': -2}}))
+    fig_z.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
+    col_g4.plotly_chart(fig_z, use_container_width=True)
     
     st.divider()
     
-    # ================== DONUT OBJETIVO VS ACTUAL Y CONTRIBUCIÓN AL RIESGO ==================
+    # ================== DONUTS ==================
     col_d1, col_d2 = st.columns(2)
-    
     with col_d1:
         st.subheader("🎯 Asignación Objetivo")
-        fig_target = px.pie(
-            names=target_weights.index,
-            values=target_weights.values,
-            hole=0.6,
-            title="Pesos objetivo"
-        )
+        fig_target = px.pie(names=target_weights.index, values=target_weights.values, hole=0.6)
         st.plotly_chart(fig_target, use_container_width=True)
-    
     with col_d2:
         st.subheader("📉 Contribución al Riesgo Actual")
-        risk_df = pd.DataFrame({
-            "Activo": target_weights.index,
-            "Contribución": risk_contrib
-        })
-        fig_risk = px.pie(
-            risk_df,
-            names="Activo",
-            values="Contribución",
-            hole=0.6,
-            title="Risk contribution (actual)"
-        )
+        risk_df = pd.DataFrame({"Activo": target_weights.index, "Contribución": risk_contrib})
+        fig_risk = px.pie(risk_df, names="Activo", values="Contribución", hole=0.6)
         st.plotly_chart(fig_risk, use_container_width=True)
     
-    # Tabla de desviaciones
+    # Tabla desviaciones
     st.subheader("📋 Desviación vs Objetivo")
     df_compare = pd.DataFrame({
         "Objetivo": target_weights,
@@ -467,15 +377,12 @@ def main():
     
     # ================== MONTE CARLO ESCENARIOS ==================
     st.subheader("📈 Monte Carlo 10 años (escenarios)")
-    # Escenario conservador: retorno esperado -2%, vol +2%
-    mu_conserv = expected_return - 0.02
-    vol_conserv = target_vol + 0.02
-    # Escenario base
     mu_base = expected_return
     vol_base = target_vol
-    # Escenario optimista
-    mu_opt = expected_return + 0.02
-    vol_opt = target_vol - 0.02
+    mu_conserv = mu_base - 0.02
+    vol_conserv = vol_base + 0.02
+    mu_opt = mu_base + 0.02
+    vol_opt = vol_base - 0.02
     
     mc_conserv = run_monte_carlo(current_total, monthly_injection, 10, mu_conserv, vol_conserv)
     mc_base = run_monte_carlo(current_total, monthly_injection, 10, mu_base, vol_base)
@@ -490,7 +397,7 @@ def main():
     col_m2.metric("Base", f"{prob_base:.1%}")
     col_m3.metric("Optimista", f"{prob_opt:.1%}")
     
-    # Histogramas
+    # Histograma
     fig_mc = go.Figure()
     fig_mc.add_trace(go.Histogram(x=mc_conserv, name="Conservador", opacity=0.5))
     fig_mc.add_trace(go.Histogram(x=mc_base, name="Base", opacity=0.5))
@@ -501,7 +408,7 @@ def main():
     
     st.divider()
     
-    # ================== ÓRDENES Y EJECUCIÓN ==================
+    # ================== ÓRDENES ==================
     st.subheader("🛒 Órdenes sugeridas")
     if orders:
         for t, units in orders.items():
@@ -511,26 +418,23 @@ def main():
         st.write(f"**Reserva restante tras compras:** {remaining_cash:.2f} €")
         
         if st.button("✅ Confirmar ejecución"):
-            # Ejecutar órdenes
             portfolio = execute_orders(portfolio, orders, latest_prices)
-            # Actualizar reserva (ya se resta dentro de execute_orders)
             st.success("Órdenes ejecutadas. Cartera actualizada.")
             st.rerun()
     else:
         st.info("No hay órdenes generadas (saldo insuficiente o cartera ya equilibrada).")
     
-    # Mostrar reserva estructural
     st.write(f"**Reserva estructural recomendada (8%):** {structural_reserve:.2f} €")
-    st.write(f"**Reserva actual tras operación:** {remaining_cash:.2f} €")
+    st.write(f"**Reserva real tras operación:** {remaining_cash:.2f} €")
     
     st.divider()
     
     # ================== DIAGNÓSTICO ==================
     st.subheader("🧠 Diagnóstico de Mercado")
     if regime == "RISK_ON":
-        st.success("🔵 Régimen RISK ON: volatilidad baja, momento favorable. Máxima exposición.")
+        st.success("🔵 Régimen RISK ON: volatilidad baja. Momento favorable.")
     elif regime == "RISK_OFF":
-        st.warning("🟠 Régimen RISK OFF: volatilidad alta. Priorizando defensa y reducción de riesgo.")
+        st.warning("🟠 Régimen RISK OFF: volatilidad alta. Priorizando defensa.")
     elif regime == "ATTACK_MODE":
         st.error("🔴 MODO ATAQUE: BTC en capitulación extrema. Aumentando exposición táctica.")
     else:
