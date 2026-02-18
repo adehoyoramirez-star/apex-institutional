@@ -61,13 +61,22 @@ for t in tickers:
 weights_current = pd.Series(values) / total_value
 
 # =========================
-# REGIMEN MERCADO
+# REGIMEN MERCADO (Versión Corregida para Streamlit)
 # =========================
-vix = yf.download("^VIX", period="3y")["Close"]
-vix_now = vix.iloc[-1]
-vix_p70 = vix.quantile(0.7)
-vix_p30 = vix.quantile(0.3)
+vix_data = yf.download("^VIX", period="3y", progress=False)["Close"]
 
+# Usamos .squeeze() para asegurar que si es un DataFrame de una columna, se convierta en Serie
+if isinstance(vix_data, pd.DataFrame):
+    vix = vix_data.iloc[:, 0] # Tomamos la primera columna
+else:
+    vix = vix_data
+
+# Extraemos los valores como números puros (floats)
+vix_now = float(vix.iloc[-1])
+vix_p70 = float(vix.quantile(0.7))
+vix_p30 = float(vix.quantile(0.3))
+
+# Ahora la comparación funciona perfectamente
 if vix_now > vix_p70:
     regime = "RISK_OFF"
     target_vol = 0.10
@@ -77,7 +86,6 @@ elif vix_now < vix_p30:
 else:
     regime = "NEUTRAL"
     target_vol = 0.15
-
 # =========================
 # BTC CAPITULATION
 # =========================
@@ -211,5 +219,7 @@ BTC Z: {btc_z:.2f}
 Probabilidad 150k: {prob_goal:.1%}
 Comprar: {orders}
 """
+# Añade esto a tu variable 'report'
+report += f"📊 VIX Actual: `{vix_now:.2f}` (Umbral Riesgo: `{vix_p70:.2f}`)"
 
 send_telegram(message)
