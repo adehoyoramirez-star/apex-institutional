@@ -97,5 +97,78 @@ sims = 10000
 mc = (total_value + (monthly_injection * 120)) * np.exp((mu_p - 0.5 * vol_p**2) + vol_p * np.random.normal(0, 1, sims))
 prob_goal = np.mean(mc >= target_goal)
 
-# =================
+# =========================
+# RESERVA Y ÓRDENES
+# =========================
+reserve_file = "cash_reserve.csv"
+try:
+    current_reserve = float(pd.read_csv(reserve_file)["reserve"].iloc[-1])
+except:
+    current_reserve = 0.0
 
+total_cash = monthly_injection + current_reserve
+orders, spent = {}, 0
+
+for t in tickers:
+    price = latest_prices[t]
+    if pd.isna(price) or price <= 0: continue
+    alloc = optimal_weights[t] * total_cash
+    if t == "BTC-EUR":
+        units = round(alloc / price, 6)
+        orders[t] = units
+        spent += units * price
+    else:
+        units = int(alloc // price)
+        if units > 0:
+            orders[t] = units
+            spent += units * price
+
+new_reserve = total_cash - spent
+pd.DataFrame({"reserve": [new_reserve]}).to_csv(reserve_file, index=False)
+
+# =========================
+# DASHBOARD VISUAL
+# =========================
+st.title("🦅 APEX INSTITUTIONAL")
+
+# KPIs
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("RÉGIMEN", regime)
+m2.metric("PROB. ÉXITO", f"{prob_goal:.1%}")
+m3.metric("BTC RSI", f"{btc_rsi:.2f}")
+m4.metric("ERP REAL", f"{erp_real:.2%}")
+
+st.divider()
+
+col_l, col_r = st.columns(2)
+with col_l:
+    st.subheader("🎯 Pesos Objetivo")
+    # FIX: Se asocian nombres y valores explícitamente para evitar cruce
+    fig_donut = px.pie(
+        names=optimal_weights.index, 
+        values=optimal_weights.values, 
+        hole=0.6,
+        color_discrete_sequence=px.colors.qualitative.Bold
+    )
+    fig_donut.update_traces(textinfo='percent+label')
+    st.plotly_chart(fig_donut, use_container_width=True)
+
+with col_r:
+    st.subheader("🛒 Órdenes")
+    st.json(orders)
+    st.write(f"**Pólvora sobrante:** {new_reserve:.2f}€")
+
+# HISTOGRAMA MONTE CARLO (Línea 174 corregida)
+st.subheader("📈 Distribución de Valor Final (10 Años)")
+fig_mc = px.histogram(
+    mc, 
+    nbins=50, 
+    title="Simulación de Capital Final",
+    labels={'value': 'Capital en €', 'count': 'Frecuencia'}
+)
+st.plotly_chart(fig_mc, use_container_width=True)
+
+if st.button("🚀 Enviar Informe"):
+    msg = f"🦅 *APEX:* {regime}\n*Prob:* {prob_goal:.1%}\n*ERP:* {erp_real:.2%}\n\n*Compras:* `{orders}`"
+    send_telegram(msg)
+    st.toast("Informe enviado")
