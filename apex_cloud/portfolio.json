@@ -8,12 +8,24 @@
     "PPFB.DE": { "shares": 4, "avg_price": 69.39 },
     "U3O8.DE": { "shares": 13, "avg_price": 26.48 }
   },
+  "tickers": ["IS3Q.DE", "PPFB.DE", "VVSM.DE", "ZPRR.DE", "BTC-EUR", "U3O8.DE", "EMXC.DE"],
+  "vol_targets": {
+    "RISK_ON": 0.22,
+    "NEUTRAL": 0.14,
+    "RISK_OFF": 0.07,
+    "SNIPER": 0.18
+  },
+  "macro_series": {
+    "DGS10": "^TNX",
+    "M2SL": "M2SL",
+    "SP500": "^GSPC"
+  },
+  "telegram": {
+    "token": "8256161361:AAFqdfl7uTe02FGf6pCzP5qetDMdK-DUFy0",
+    "chat_id": "8247498069"
+  },
   "monthly_injection": 400,
   "btc_cap": 0.25,
   "max_drawdown": 0.25,
-  "target_goal": 150000,
-  "telegram_token": "8256161361:AAFqdfl7uTe02FGf6pCzP5qetDMdK-DUFy0",
-  "telegram_chat_id": "8247498069"
+  "target_goal": 150000
 }
-
-
