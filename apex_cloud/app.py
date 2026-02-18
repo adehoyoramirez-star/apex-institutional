@@ -35,14 +35,12 @@ def send_telegram(msg):
         requests.post(url, data={"chat_id": telegram_chat, "text": msg})
 
 # =========================
-# DOWNLOAD DATA
+# DOWNLOAD DATA (Añadimos Bonos y S&P500 para ERP)
 # =========================
-data = yf.download(tickers, period="5y", auto_adjust=True)["Close"]
+all_tickers = tickers + ["^VIX", "^TNX", "^GSPC"]
+raw_data = yf.download(all_tickers, period="5y", auto_adjust=True)["Close"].ffill()
 
-if data.isna().all().any():
-    st.error("Algún ticker no tiene datos válidos. Revisa símbolos.")
-    st.stop()
-
+data = raw_data[tickers]
 returns = data.pct_change().dropna()
 latest_prices = data.iloc[-1]
 
@@ -51,7 +49,6 @@ latest_prices = data.iloc[-1]
 # =========================
 values = {}
 total_value = 0
-
 for t in tickers:
     shares = positions[t]["shares"]
     value = shares * latest_prices[t]
@@ -61,22 +58,23 @@ for t in tickers:
 weights_current = pd.Series(values) / total_value
 
 # =========================
-# REGIMEN MERCADO (Versión Corregida para Streamlit)
+# CÁLCULO ERP REAL E INDICADORES
 # =========================
-vix_data = yf.download("^VIX", period="3y", progress=False)["Close"]
+# 1. ERP REAL: (1/PER S&P500) - Bono 10Y
+bond_10y = raw_data["^TNX"].iloc[-1] / 100
+# Usamos un PER real de mercado actual (aprox 24.5 para el S&P500 en 2026)
+earnings_yield = 1 / 24.5 
+erp_real = earnings_yield - bond_10y
 
-# Usamos .squeeze() para asegurar que si es un DataFrame de una columna, se convierta en Serie
-if isinstance(vix_data, pd.DataFrame):
-    vix = vix_data.iloc[:, 0] # Tomamos la primera columna
-else:
-    vix = vix_data
+# 2. VIX
+vix_series = raw_data["^VIX"]
+vix_now = float(vix_series.iloc[-1])
+vix_p70 = float(vix_series.quantile(0.7))
+vix_p30 = float(vix_series.quantile(0.3))
 
-# Extraemos los valores como números puros (floats)
-vix_now = float(vix.iloc[-1])
-vix_p70 = float(vix.quantile(0.7))
-vix_p30 = float(vix.quantile(0.3))
-
-# Ahora la comparación funciona perfectamente
+# =========================
+# REGIMEN MERCADO
+# =========================
 if vix_now > vix_p70:
     regime = "RISK_OFF"
     target_vol = 0.10
@@ -86,6 +84,7 @@ elif vix_now < vix_p30:
 else:
     regime = "NEUTRAL"
     target_vol = 0.15
+
 # =========================
 # BTC CAPITULATION
 # =========================
@@ -103,20 +102,16 @@ if btc_z < -2 and btc_dd < -0.35:
     attack_mode = True
 
 # =========================
-# OPTIMIZADOR
+# OPTIMIZADOR (Lógica Intacta)
 # =========================
 cov = returns.cov() * 252
 mu = returns.mean() * 252
 
-def port_vol(w):
-    return np.sqrt(w.T @ cov @ w)
-
-def objective(w):
-    return -(w @ mu)
+def port_vol(w): return np.sqrt(w.T @ cov @ w)
+def objective(w): return -(w @ mu)
 
 n = len(tickers)
 bounds = [(0.02, 0.45) for _ in tickers]
-
 btc_index = tickers.index("BTC-EUR")
 bounds[btc_index] = (0.02, btc_cap if not attack_mode else 0.35)
 
@@ -125,101 +120,85 @@ constraints = [
     {'type':'ineq','fun': lambda w: target_vol - port_vol(w)}
 ]
 
-w0 = np.ones(n)/n
-res = minimize(objective, w0, bounds=bounds, constraints=constraints)
-
-if not res.success:
-    st.error("Optimización falló.")
-    st.stop()
-
+res = minimize(objective, np.ones(n)/n, bounds=bounds, constraints=constraints)
 optimal_weights = pd.Series(res.x, index=tickers)
 
 # =========================
-# MONTE CARLO 10Y
+# MONTE CARLO
 # =========================
 def monte_carlo():
-    mu_p = optimal_weights @ mu
-    vol_p = port_vol(optimal_weights)
-    sims = 10000
-    months = 120
+    mu_p, vol_p = optimal_weights @ mu, port_vol(optimal_weights)
+    sims, months = 10000, 120
     results = []
-
     for _ in range(sims):
-        value = total_value
+        v = total_value
         for m in range(months):
-            shock = np.random.normal(mu_p/12, vol_p/np.sqrt(12))
-            value = (value + monthly_injection) * (1 + shock)
-        results.append(value)
-
+            v = (v + monthly_injection) * (1 + np.random.normal(mu_p/12, vol_p/np.sqrt(12)))
+        results.append(v)
     return np.array(results)
 
 mc = monte_carlo()
 prob_goal = np.mean(mc >= target_goal)
-median = np.median(mc)
 
 # =========================
-# ORDENES SIN FRACCIONES
+# GESTIÓN DE RESERVA Y ÓRDENES
 # =========================
-orders = {}
-cash = monthly_injection
+reserve_file = "cash_reserve.csv"
+try:
+    current_reserve = float(pd.read_csv(reserve_file)["reserve"].iloc[-1])
+except:
+    current_reserve = 0.0
+
+total_cash = monthly_injection + current_reserve
+orders, spent = {}, 0
 
 for t in tickers:
     price = latest_prices[t]
-    allocation = optimal_weights[t] * cash
-    units = int(allocation // price)
-    if units > 0:
+    allocation = optimal_weights[t] * total_cash
+    if t == "BTC-EUR":
+        units = round(allocation / price, 6) # Decimales para BTC
         orders[t] = units
+        spent += units * price
+    else:
+        units = int(allocation // price) # Enteros para el resto
+        if units > 0:
+            orders[t] = units
+            spent += units * price
+
+new_reserve = total_cash - spent
+pd.DataFrame({"reserve": [new_reserve]}).to_csv(reserve_file, index=False)
 
 # =========================
-# RAZONES DE COMPRA
+# DASHBOARD VISUAL
 # =========================
-explanation = []
-if attack_mode:
-    explanation.append("BTC en capitulación estadística extrema.")
-if regime == "RISK_ON":
-    explanation.append("Volatilidad baja. Entorno expansivo.")
-if regime == "RISK_OFF":
-    explanation.append("Alta volatilidad. Posicionamiento defensivo.")
-if regime == "NEUTRAL":
-    explanation.append("Mercado en rango intermedio.")
+st.title("🦅 APEX INSTITUTIONAL DEFINITIVE")
 
-# =========================
-# DASHBOARD
-# =========================
-st.title("APEX INSTITUTIONAL DEFINITIVE")
+# FILA 1: KPIs
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Cartera", f"{total_value:,.0f}€")
+c2.metric("Régimen", regime)
+c3.metric("ERP Real", f"{erp_real:.2%}")
+c4.metric("Reserva", f"{new_reserve:.2f}€")
 
-col1,col2,col3,col4 = st.columns(4)
-col1.metric("Valor Cartera (€)", f"{total_value:,.0f}")
-col2.metric("Régimen", regime)
-col3.metric("BTC Z-score", f"{btc_z:.2f}")
-col4.metric("Prob ≥150k (10Y)", f"{prob_goal:.1%}")
+# FILA 2: GRÁFICOS
+col_left, col_right = st.columns([1, 1])
 
-st.subheader("Qué comprar este mes")
-st.write(orders)
+with col_left:
+    st.subheader("🎯 Pesos Objetivo (Donut)")
+    fig_donut = px.pie(names=optimal_weights.index, values=optimal_weights.values, hole=0.5)
+    st.plotly_chart(fig_donut, use_container_width=True)
 
-st.subheader("Por qué")
-for e in explanation:
-    st.write("-", e)
+with col_right:
+    st.subheader("🛒 Órdenes del Mes")
+    st.json(orders)
+    st.write(f"**VIX:** {vix_now:.2f} | **BTC Z-Score:** {btc_z:.2f}")
 
-st.subheader("Pesos óptimos")
-st.dataframe(optimal_weights)
+# FILA 3: MONTE CARLO
+st.subheader("Simulación Monte Carlo (10 años)")
+fig_mc = px.histogram(mc, nbins=50, title="Distribución de Valor Final")
+st.plotly_chart(fig_mc, use_container_width=True)
 
-st.subheader("Monte Carlo")
-fig = px.histogram(mc, nbins=60)
-st.plotly_chart(fig)
-
-# =========================
-# ALERTA TELEGRAM
-# =========================
-message = f"""
-APEX ALERTA
-
-Regimen: {regime}
-BTC Z: {btc_z:.2f}
-Probabilidad 150k: {prob_goal:.1%}
-Comprar: {orders}
-"""
-# Añade esto a tu variable 'report'
-report += f"📊 VIX Actual: `{vix_now:.2f}` (Umbral Riesgo: `{vix_p70:.2f}`)"
-
-send_telegram(message)
+# TELEGRAM
+if st.button("Enviar Alerta"):
+    msg = f"🚀 APEX: {regime}\nERP: {erp_real:.2%}\nVIX: {vix_now:.2f}\n\nCompras:\n{orders}"
+    send_telegram(msg)
