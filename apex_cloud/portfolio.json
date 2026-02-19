@@ -8,6 +8,12 @@
     "VVSM.DE": {"shares": 2, "avg_price": 52.01},
     "ZPRR.DE": {"shares": 6, "avg_price": 61.67}
   },
+  "monthly_injection": 500,
+  "btc_cap": 0.25,
+  "max_drawdown": 0.20,
+  "target_goal": 150000,
   "cash_reserve": 150,
-  "last_updated": "2025-01-01"
+  "last_updated": "2025-01-01",
+  "telegram_token": "TU_TOKEN_AQUI",
+  "telegram_chat_id": "TU_ID_AQUI"
 }
