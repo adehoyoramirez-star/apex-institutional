@@ -13,8 +13,5 @@
   "max_drawdown": 0.20,
   "target_goal": 150000,
   "cash_reserve": 150,
-  "last_updated": "2025-01-01",
-  "telegram_token": "TU_TOKEN_AQUI",
-  "telegram_chat_id": "TU_ID_AQUI"
+  "last_updated": "2025-01-01"
 }
-
