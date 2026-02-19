@@ -4,5 +4,6 @@ pandas
 numpy
 plotly
 scipy
-pandas-datareader
+pandas-datareader>=0.11.0
+packaging
 requests
