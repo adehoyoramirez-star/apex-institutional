@@ -4,12 +4,17 @@
     "EMXC.DE": {"shares": 31, "avg_price": 28.93},
     "IS3Q.DE": {"shares": 26, "avg_price": 67.53},
     "PPFB.DE": {"shares": 4, "avg_price": 69.39},
-    "URNU.DE": {"shares": 13, "avg_price": 26.48},  ← CAMBIADO
+    "URNU.DE": {"shares": 13, "avg_price": 26.48},
     "VVSM.DE": {"shares": 2, "avg_price": 52.01},
     "ZPRR.DE": {"shares": 6, "avg_price": 61.67}
   },
+  "monthly_injection": 500,
+  "btc_cap": 0.25,
+  "max_drawdown": 0.20,
+  "target_goal": 150000,
   "cash_reserve": 150,
-  "last_updated": "2025-01-01"
+  "last_updated": "2025-01-01",
+  "telegram_token": "TU_TOKEN_AQUI",
+  "telegram_chat_id": "TU_ID_AQUI"
 }
-
 
