@@ -8,6 +8,8 @@ from scipy.optimize import minimize
 import json
 import os
 from datetime import datetime
+import pandas_datareader.data as web
+import requests
 
 # ================== CONFIGURACIÓN ==================
 st.set_page_config(layout="wide", page_title="APEX 150K ELITE")
@@ -52,46 +54,37 @@ def load_portfolio():
         "last_updated": datetime.now().isoformat()
     }
 
-    # Si el archivo no existe, lo creamos con los datos por defecto
     if not os.path.exists(PORTFOLIO_FILE):
         with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
             json.dump(default, f, indent=2, ensure_ascii=False)
         return default
 
-    # Intentar cargar el archivo
     try:
         with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        # Mostrar error y permitir edición
         st.error(f"**Error en el archivo `portfolio.json`:** {str(e)}")
         st.markdown("### Edita el contenido y pulsa Guardar")
 
-        # Leer contenido actual (puede tener caracteres raros)
         with open(PORTFOLIO_FILE, "r", encoding="utf-8", errors="ignore") as f:
             raw_content = f.read()
 
-        # Editor de texto
         new_content = st.text_area("Contenido actual (corrígelo si es necesario):", raw_content, height=400)
 
         if st.button("💾 Guardar y reiniciar"):
-            # Validar el nuevo contenido
             try:
-                json.loads(new_content)  # Comprobar si es válido
-                # Guardar copia de seguridad
+                json.loads(new_content)
                 backup_name = f"portfolio_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
                 with open(backup_name, "w", encoding="utf-8") as f:
                     f.write(raw_content)
-                # Guardar nuevo contenido
                 with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
                     f.write(new_content)
                 st.success("Archivo guardado correctamente. Reiniciando...")
                 st.rerun()
             except json.JSONDecodeError as e2:
                 st.error(f"El JSON sigue siendo inválido: {e2}. Corrígelo y vuelve a intentar.")
-        st.stop()  # No continuar hasta que se solucione
+        st.stop()
 
-    # Asegurar que todas las claves existen
     for t in TICKERS:
         if t not in data["positions"]:
             data["positions"][t] = {"shares": 0, "avg_price": 0}
@@ -103,35 +96,59 @@ def save_portfolio(portfolio):
     with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
         json.dump(portfolio, f, indent=2, ensure_ascii=False)
 
-# ================== DATOS DE MERCADO ==================
+# ================== DATOS DE MERCADO (incluyendo liquidez global) ==================
+@st.cache_data(ttl=3600)  # 1 hora de caché para datos macro
+def get_macro_liquidity_data():
+    """Descarga indicadores de liquidez global (M2, tipos, etc.)"""
+    # Intentar obtener M2 de FRED
+    try:
+        # Necesitas una API key de FRED (opcional, pero sin ella puede fallar)
+        # Puedes obtener una gratis en https://fred.stlouisfed.org/docs/api/api_key.html
+        # Si no tienes, usamos datos simulados
+        m2 = web.DataReader("M2SL", "fred", start="2015-01-01")  # M2 Money Stock
+        m2_latest = m2.iloc[-1, 0]
+        m2_growth = (m2_latest / m2.iloc[-13, 0] - 1) * 100  # crecimiento interanual aproximado
+    except:
+        m2_latest = 21000  # valor simulado en miles de millones
+        m2_growth = 5.0    # crecimiento simulado
+
+    # Obtener tipos de Yahoo Finance
+    try:
+        tnx = yf.download("^TNX", period="5d", progress=False)["Close"].iloc[-1]  # 10 años
+        irx = yf.download("^IRX", period="5d", progress=False)["Close"].iloc[-1]  # 3 meses
+        # TED spread aproximado (diferencial 10 años - 3 meses)
+        ted_spread = tnx - irx
+    except:
+        tnx, irx, ted_spread = 4.0, 3.0, 1.0  # valores simulados
+
+    return {
+        "m2_value": m2_latest,
+        "m2_growth": m2_growth,
+        "tnx": tnx,
+        "irx": irx,
+        "ted_spread": ted_spread
+    }
+
 @st.cache_data(ttl=300)
 def get_market_data():
-    """Descarga datos de Yahoo Finance. Si falla, usa datos simulados."""
-    all_tickers = TICKERS + ["^VIX", "^TNX", "^GSPC"]
+    """Descarga precios de activos y VIX."""
+    all_tickers = TICKERS + ["^VIX", "^GSPC"]
     try:
-        raw = yf.download(all_tickers, period="5y", auto_adjust=True, progress=False)["Close"]
-        raw = raw.ffill().bfill()
+        raw = yf.download(all_tickers, period="5y", auto_adjust=True, progress=False)["Close"].ffill().bfill()
         prices = raw[TICKERS]
-        macro = raw[["^VIX", "^TNX", "^GSPC"]]
+        macro = raw[["^VIX", "^GSPC"]]
     except Exception as e:
-        st.warning(f"Error al descargar datos: {e}. Usando datos simulados (no reales).")
-        # Datos sintéticos
+        st.warning(f"Error al descargar datos de mercado: {e}. Usando datos simulados.")
         dates = pd.date_range(end=datetime.now(), periods=252*5, freq='B')
         prices = pd.DataFrame(index=dates, columns=TICKERS)
         for t in TICKERS:
             prices[t] = np.random.randn(len(dates)).cumsum() + 100
-        macro = pd.DataFrame(index=dates, columns=["^VIX", "^TNX", "^GSPC"])
+        macro = pd.DataFrame(index=dates, columns=["^VIX", "^GSPC"])
         macro["^VIX"] = np.random.uniform(10, 30, len(dates))
-        macro["^TNX"] = np.random.uniform(1, 5, len(dates))
         macro["^GSPC"] = np.random.randn(len(dates)).cumsum() + 4000
     return prices, macro
 
-# ================== RESTO DE FUNCIONES (sin cambios) ==================
-# (Se mantienen igual que en la versión anterior: get_regime, check_btc_attack,
-# optimize_portfolio, risk_contribution, run_monte_carlo, generate_orders, execute_orders)
-# Por brevedad, incluyo solo las cabeceras, pero debes copiar el código completo desde la respuesta anterior.
-# Asegúrate de que todas las funciones estén presentes.
-
+# ================== RÉGIMEN ==================
 def get_regime(vix, vix_series):
     vix_p80 = vix_series.quantile(0.8)
     vix_p20 = vix_series.quantile(0.2)
@@ -148,6 +165,7 @@ def check_btc_attack(btc_series):
     btc_z = (btc_series.iloc[-1] - ma200.iloc[-1]) / std200.iloc[-1]
     return btc_z < -2, btc_z
 
+# ================== OPTIMIZACIÓN ==================
 def optimize_portfolio(returns, target_vol, btc_min, btc_max, sector_map, sector_cap):
     mu = returns.mean() * 252
     cov = returns.cov() * 252
@@ -180,12 +198,14 @@ def optimize_portfolio(returns, target_vol, btc_min, btc_max, sector_map, sector
     
     return pd.Series(result.x, index=returns.columns)
 
+# ================== CONTRIBUCIÓN AL RIESGO ==================
 def risk_contribution(weights, cov):
     port_var = weights @ cov @ weights
     marginal_contrib = cov @ weights
     risk_contrib = weights * marginal_contrib / np.sqrt(port_var)
     return risk_contrib / risk_contrib.sum()
 
+# ================== MONTE CARLO ==================
 def run_monte_carlo(current_value, monthly_injection, years, mu, vol, n_sims=5000):
     months = years * 12
     monthly_mu = mu / 12
@@ -199,6 +219,7 @@ def run_monte_carlo(current_value, monthly_injection, years, mu, vol, n_sims=500
         results.append(value)
     return np.array(results)
 
+# ================== GENERAR ÓRDENES ==================
 def generate_orders(current_weights, target_weights, current_values, cash_available, prices):
     total_value = sum(current_values.values())
     target_values = {t: target_weights[t] * (total_value + cash_available) for t in target_weights.index}
@@ -260,6 +281,9 @@ def main():
     prices_df, macro_df = get_market_data()
     latest_prices = prices_df.iloc[-1]
     
+    # Datos de liquidez global
+    liquidity = get_macro_liquidity_data()
+    
     # Calcular valor actual
     current_values = {}
     for t in TICKERS:
@@ -272,7 +296,7 @@ def main():
     else:
         current_weights = pd.Series({t: current_values[t]/current_total for t in TICKERS})
     
-    # Datos macro
+    # Datos macro (VIX)
     vix = macro_df["^VIX"].iloc[-1]
     vix_series = macro_df["^VIX"]
     regime, target_vol = get_regime(vix, vix_series)
@@ -318,12 +342,80 @@ def main():
     
     st.divider()
     
-    # Gauges macro (incluirlos aquí, pero por brevedad no los repito; copiar de la versión anterior)
-    # ... (pon los mismos gauges que antes)
+    # ================== GAUGES MACRO (incluyendo liquidez global) ==================
+    st.subheader("📊 Panorama de Liquidez Global")
+    col_l1, col_l2, col_l3, col_l4 = st.columns(4)
+    
+    # Gauge M2 Crecimiento
+    fig_m2 = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=liquidity["m2_growth"],
+        title="M2 Crecimiento % (anual)",
+        number={'suffix': '%'},
+        gauge={
+            'axis': {'range': [-5, 15]},
+            'bar': {'color': "darkblue"},
+            'steps': [
+                {'range': [-5, 2], 'color': "red"},
+                {'range': [2, 5], 'color': "yellow"},
+                {'range': [5, 15], 'color': "lightgreen"}],
+            'threshold': {
+                'line': {'color': "black", 'width': 4},
+                'thickness': 0.75,
+                'value': 5}}))
+    fig_m2.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
+    col_l1.plotly_chart(fig_m2, use_container_width=True)
+    
+    # Gauge TED Spread (aproximado)
+    fig_ted = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=liquidity["ted_spread"],
+        title="Curva 10y-3m (pb)",
+        number={'suffix': ' pb'},
+        gauge={
+            'axis': {'range': [-200, 200]},
+            'bar': {'color': "darkred"},
+            'steps': [
+                {'range': [-200, 0], 'color': "red"},
+                {'range': [0, 100], 'color': "yellow"},
+                {'range': [100, 200], 'color': "lightgreen"}],
+            'threshold': {
+                'line': {'color': "black", 'width': 4},
+                'thickness': 0.75,
+                'value': 50}}))
+    fig_ted.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
+    col_l2.plotly_chart(fig_ted, use_container_width=True)
+    
+    # Gauge VIX (ya lo tenías, pero lo movemos aquí para agrupar liquidez)
+    vix_p80 = vix_series.quantile(0.8)
+    fig_vix = go.Figure(go.Indicator(
+        mode="gauge+number", value=vix, title="VIX",
+        gauge={'axis': {'range': [0, 40]},
+               'bar': {'color': 'darkblue'},
+               'steps': [{'range': [0, 20], 'color': 'lightgreen'},
+                         {'range': [20, 30], 'color': 'yellow'},
+                         {'range': [30, 40], 'color': 'red'}],
+               'threshold': {'line': {'color': 'black', 'width': 4}, 'thickness': 0.75, 'value': vix_p80}}))
+    fig_vix.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
+    col_l3.plotly_chart(fig_vix, use_container_width=True)
+    
+    # Gauge Z-score BTC (también lo movemos)
+    fig_z = go.Figure(go.Indicator(
+        mode="gauge+number", value=btc_z, title="BTC Z-score (200d)",
+        gauge={'axis': {'range': [-3, 3]},
+               'bar': {'color': 'orange'},
+               'steps': [{'range': [-1, 1], 'color': 'lightgreen'},
+                         {'range': [1, 2], 'color': 'yellow'},
+                         {'range': [2, 3], 'color': 'red'},
+                         {'range': [-2, -1], 'color': 'yellow'},
+                         {'range': [-3, -2], 'color': 'red'}],
+               'threshold': {'line': {'color': 'black', 'width': 4}, 'thickness': 0.75, 'value': -2}}))
+    fig_z.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=10))
+    col_l4.plotly_chart(fig_z, use_container_width=True)
     
     st.divider()
     
-    # Donuts y tabla
+    # ================== DONUTS Y TABLA (igual que antes) ==================
     col_d1, col_d2 = st.columns(2)
     with col_d1:
         st.subheader("🎯 Asignación Objetivo")
@@ -353,7 +445,7 @@ def main():
     
     st.divider()
     
-    # Monte Carlo escenarios
+    # ================== MONTE CARLO ESCENARIOS ==================
     st.subheader("📈 Monte Carlo 10 años (escenarios)")
     mu_base = expected_return
     vol_base = target_vol
@@ -375,7 +467,6 @@ def main():
     col_m2.metric("Base", f"{prob_base:.1%}")
     col_m3.metric("Optimista", f"{prob_opt:.1%}")
     
-    # Histograma
     fig_mc = go.Figure()
     fig_mc.add_trace(go.Histogram(x=mc_conserv, name="Conservador", opacity=0.5))
     fig_mc.add_trace(go.Histogram(x=mc_base, name="Base", opacity=0.5))
@@ -386,7 +477,7 @@ def main():
     
     st.divider()
     
-    # Órdenes
+    # ================== ÓRDENES ==================
     st.subheader("🛒 Órdenes sugeridas")
     if orders:
         for t, units in orders.items():
